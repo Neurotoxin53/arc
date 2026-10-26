@@ -1,6 +1,6 @@
 # ArcMod: handoff
 
-Updated 2026-10-24. Read this, then [runtime-status.md](runtime-status.md) for what currently works and
+Updated 2026-10-25. Read this, then [runtime-status.md](runtime-status.md) for what currently works and
 what doesn't. Runtime status wins where older notes disagree.
 
 ## What this is
@@ -9,7 +9,9 @@ ArcMod is a patched copy of Arc **1.168.0 (88413), arm64**, built next to the re
 ID, name and data folder. It runs without an Arc account, blocks The Browser Company's services, and adds
 tools for coding agents. `/Applications/Arc.app` and the original Arc profile are never modified.
 
-- `master` has every feature; `no-login` has only account-free use and service blocking.
+- One branch, `master`. The extras (sidebar marker, icon badge, One Little Arc, agent tools, update
+  checks) are switches in Settings → ArcMod; the old `no-login` branch is archived as the
+  `no-login-final` tag.
 - The engine (`ArcCore.framework`) is Arc's own by default. Our replacement built from Chromium source is
   [Arc Engine](https://github.com/CryogenicPlanet/arc-engine), included as the `engine/` submodule. For
   engine development, clone it next to this repo as `../arc-engine`; its tests expect that layout.
@@ -59,7 +61,11 @@ is a pristine 1.168.0 app to pass as `--source` when the installed Arc has updat
 - The ad hoc re-signed copy has no iCloud entitlement, and Arc aborts at launch in CloudKit unless
   `cloudKitSyncEnabled=false` is set in the mod's defaults domain. ArcMod.dylib writes it at load (and
   `firebaseSyncEnabled=false`) on every launch. Re-signing also loses Firebase sync, account login,
-  passkeys and push, which are tied to Arc's Developer ID signature. Sparkle updates are disabled.
+  iCloud Keychain passkeys and push, which need Apple's `com.apple.developer.web-browser.public-key-credential`
+  entitlement on a Developer ID. Sparkle updates are disabled. Do not embed that entitlement on an ad hoc
+  signature: Chromium then tries iCloud Keychain and drops the phone and security-key fallbacks.
+  Login-keychain mode (`notes/passwords-keychain.md`) is separate. It stores this app's OSCrypt key as
+  `ArcMod Safe Storage` and rewrites Chromium's lookup so Arc's `Arc Safe Storage` item is not read.
 - `codesign` appends a 16-byte load command without checking header room. If an inserted load command
   fills the padding, it overwrites the start of `__text` (SIGILL). `tools/insert-dylib.ts` reserves room.
 - Feature flags resolve default → LaunchDarkly → override. Overrides need no patch: the

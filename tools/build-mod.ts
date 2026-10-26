@@ -3,14 +3,15 @@
 // 1.168.0, else the copy in bin/).
 //   - own bundle id (company.thebrowser.Browser.mod) and Sparkle auto-update disabled
 //   - arm64 executable, required ArcMod.dylib, fingerprinted local UI/URL/single-Little-Arc patches
-//   - every nested binary re-signed ad hoc, inside-out, WITHOUT hardened runtime (so no library
-//     validation) and without Arc's restricted entitlements (iCloud, keychain groups, push)
+//   - every nested binary re-signed inside-out. The default is ad hoc, WITHOUT hardened runtime (so no
+//     library validation) and without Arc's restricted entitlements (iCloud, keychain groups, push).
+//     --sign-identity / --entitlements / --hardened-runtime are for a Developer ID you already have.
 // /Applications/Arc.app is never modified.
 //
 //   bun tools/build-mod.ts [--source /Applications/Arc.app] [--validation | --agent <slug>]
 //                          [--engine <ArcCore.framework> | --engine release]   (Arc Engine; see README)
 
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { hostResolverRules, servicePolicyHeader } from "./service-policy";
@@ -18,9 +19,10 @@ import { shortcutPolicyHeader } from "./shortcut-policy";
 import { defaultArcSource } from "./arc-source";
 import { fetchEngine } from "./fetch-engine";
 import { finalApp, installedApp, runningAt, stagedApp, swapInStagedApp } from "./build-paths";
-import { currentChannel, describeArgs } from "./update";
+import { describeArgs } from "./update";
 import { verifyShippedShortcutCoverage } from "./shortcut-coverage";
 import { parseBuildOptions } from "./agent-session";
+import { keychainRewriteHeader, passkeyEntitlementWarning, signingPlanError } from "./password-keychain";
 import { acquireLease } from "./agent-lease";
 
 // All bundles share generated headers/dylib, so serialize complete builds.
@@ -84,14 +86,16 @@ console.log(`  ${sh(["xcrun", "swift", "-O", join(root, "tools/verify-foundation
 mkdirSync(join(root, "build"), { recursive: true });
 writeFileSync(join(root, "build/ArcModServiceHosts.h"), servicePolicyHeader);
 writeFileSync(join(root, "build/ArcModShortcutPolicy.h"), shortcutPolicyHeader);
+writeFileSync(join(root, "build/ArcModKeychainRewrite.h"), keychainRewriteHeader);
 
 const dylib = join(root, "build/ArcMod.dylib");
 step("compile mods/hello/ArcMod.m → build/ArcMod.dylib");
 sh([
   "clang", "-dynamiclib", "-arch", "arm64", "-fobjc-arc", "-Wall", "-Wextra", "-Werror", "-mmacosx-version-min=13.0",
-  "-framework", "AppKit", "-framework", "CoreServices", "-I", join(root, "build"), "-install_name", DYLIB_INSTALL, "-o", dylib,
+  "-framework", "AppKit", "-framework", "CoreServices", "-framework", "Security", "-I", join(root, "build"), "-install_name", DYLIB_INSTALL, "-o", dylib,
   join(root, "mods/hello/ArcMod.m"), join(root, "mods/local/ServicePolicy.m"),
-  join(root, "mods/local/ShortcutPolicy.m"),
+  join(root, "mods/local/ShortcutPolicy.m"), join(root, "mods/passwords/KeychainIsolation.m"),
+  join(root, "mods/passwords/keychain_rewrite.c"),
 ]);
 
 step(`APFS-clone app → ${relative(root, OUT)}`);
@@ -106,6 +110,8 @@ if (ENGINE !== undefined) {
   if (installName !== "@executable_path/../Frameworks/ArcCore.framework/Versions/A/ArcCore") {
     throw new Error(`engine install name is ${installName}, expected Arc's ArcCore path`);
   }
+  // KeychainIsolation rewrites "Arc Safe Storage" and "Chromium Safe Storage" onto this app's own
+  // item, so either engine string can open the everyday profile. The password is never Arc's.
   step(`engine → ${ENGINE}`);
   const frameworks = join(OUT, "Contents/Frameworks/ArcCore.framework");
   rmSync(frameworks, { recursive: true, force: true });
@@ -135,10 +141,12 @@ plutil("-remove", "NSDockTilePlugIn");
 // the unlocalized CFBundleName, so renaming never moves the data. Only the normal ArcMod can be renamed.
 plutil("-insert", "LSHasLocalizedDisplayName", "-bool", "YES");
 // Read by tools/update.ts and ArcMod's update check: the release this build came from, its engine and its source.
-const describe = Bun.spawnSync(["git", "-C", root, "describe", "--tags", "--always", "--dirty", ...describeArgs(currentChannel())]).stdout.toString().trim();
+const describe = Bun.spawnSync(["git", "-C", root, "describe", "--tags", "--always", "--dirty", ...describeArgs]).stdout.toString().trim();
 plutil("-insert", "ArcModVersion", "-string", describe || "unknown");
 plutil("-insert", "ArcModBuildEngine", "-string", options.engine === "release" ? "release" : ENGINE ?? "arc");
 plutil("-insert", "ArcModRepository", "-string", root);
+// The everyday ArcMod uses the Keychain, not Chromium's test key (tools/keychain-profile.ts checks for this).
+if (MOD_BUNDLE_ID === "company.thebrowser.Browser.mod") plutil("-insert", "ArcModKeychain", "-bool", "YES");
 const shownName = session.agent === undefined && MOD_BUNDLE_ID === "company.thebrowser.Browser.mod"
   ? Bun.spawnSync(["defaults", "read", MOD_BUNDLE_ID, "ArcModAppName"]).stdout.toString().trim()
   : "";
@@ -165,7 +173,16 @@ console.log(`  ${sh(["bun", join(root, "tools/insert-dylib.ts"), exe, DYLIB_INST
 sh(["cp", dylib, join(OUT, "Contents/Frameworks/ArcMod.dylib")]);
 
 // Inside-out: loose Mach-O files that aren't a bundle's main executable, then bundles deepest first.
-step("re-sign ad hoc, inside-out (no hardened runtime, no entitlements)");
+const signIdentity = options.signIdentity ?? "-";
+const planError = signingPlanError({ signIdentity, hardenedRuntime: options.hardenedRuntime === true });
+if (planError) throw new Error(planError);
+const entitlements = options.entitlements ? resolve(options.entitlements) : undefined;
+if (entitlements) {
+  if (!existsSync(entitlements)) throw new Error(`entitlements file not found: ${entitlements}`);
+  const warning = passkeyEntitlementWarning(signIdentity, readFileSync(entitlements, "utf8"));
+  if (warning) console.warn(`\n${warning}\n`);
+}
+step(`re-sign ${signIdentity === "-" ? "ad hoc" : signIdentity}, inside-out${options.hardenedRuntime ? ", hardened runtime" : " (no hardened runtime)"}`);
 const all = walk(OUT);
 const bundles = all.filter((p) => CODE_BUNDLE.test(p) && statSync(p).isDirectory() && p !== OUT);
 const bundleMains = new Set(
@@ -176,7 +193,14 @@ const bundleMains = new Set(
 );
 const loose = all.filter((p) => !bundleMains.has(p) && !p.startsWith(exe) && isMachO(p));
 const ordered = [...loose.toSorted((a, b) => depth(b) - depth(a)), ...bundles.toSorted((a, b) => depth(b) - depth(a)), OUT];
-const sign = (p: string): void => void sh(["codesign", "--force", "--sign", "-", "--timestamp=none", p], { quiet: true });
+const sign = (p: string): void => {
+  const args = ["codesign", "--force", "--sign", signIdentity, options.timestamp ? "--timestamp" : "--timestamp=none"];
+  if (options.hardenedRuntime) args.push("--options", "runtime");
+  // Entitlements belong on the app. Nested helpers stay without the passkey key.
+  if (entitlements && p === OUT) args.push("--entitlements", entitlements);
+  args.push(p);
+  sh(args, { quiet: true });
+};
 ordered.forEach((p) => {
   sign(p);
   console.log(`  signed ${relative(OUT, p) || "ArcMod.app"}`);

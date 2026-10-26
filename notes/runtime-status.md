@@ -8,6 +8,13 @@ changes are listed first. It is not a known-good shortcut baseline.
 
 ## Since 2026-10-13
 
+- The everyday ArcMod keeps its OSCrypt key in its own login-keychain item, `ArcMod Safe Storage`,
+  and rewrites Chromium's `Arc Safe Storage` lookup so Arc's item is not read (rebased onto
+  upstream `87bb649` on 2026-10-26). An older test-key profile is moved by `tools/keychain-profile.ts`.
+  Validation and agent builds stay on the public test key. iCloud Keychain passwords and passkeys
+  stay blocked without Apple's browser entitlement. Not launched on macOS from this checkout.
+  See [passwords-keychain.md](passwords-keychain.md).
+
 - `tools/import-arc-data.ts` copies a stock Arc profile's cookies, site storage,
   extensions, history and permissions into ArcMod (2026-10-22).
 - `bun tools/build-mod.ts --engine <ArcCore.framework>` builds ArcMod on another engine,

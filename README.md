@@ -41,6 +41,16 @@ it on your Mac and installs it as `/Applications/ArcMod.app` (`~/Applications` i
 to `/Applications`).
 
 - Quit ArcMod before you rebuild.
+- ArcMod keeps your cookies and saved passwords under its own Keychain item, "ArcMod Safe
+  Storage". It does not use Arc's "Arc Safe Storage" item. The first time a new build opens,
+  macOS asks to let ArcMod use **ArcMod Safe Storage**: choose **Always Allow** after you sign
+  with a stable identity (`bash tools/setup-signing-identity.sh`). If macOS asks for **Arc Safe
+  Storage**, choose **Deny**. An ad hoc signature changes every rebuild, so macOS asks again
+  until you use that identity.
+- ArcMod builds from before October 25, 2026 used Chromium's fixed test key instead. The first
+  time a newer build opens on that data, it opens Terminal and moves your saved cookies and
+  passwords to ArcMod's own Keychain item (`bun tools/keychain-profile.ts`). If macOS asks
+  `security` for **Arc Safe Storage**, choose **Deny**.
 - The clone downloads about 730 MB through Git LFS: about 380 MB of Arc in `bin/` and about
   350 MB of reverse-engineering files. To skip the latter, clone with
   `GIT_LFS_SKIP_SMUDGE=1`, then run `git lfs pull --include="bin/*"`.
@@ -68,15 +78,6 @@ If ArcMod is open, the update builds first and then waits for you to quit it. It
 checkout without local changes. Arc itself never updates: ArcMod stays on
 Arc 1.168.0's app.
 
-## Which branch?
-
-| Branch | What you get |
-| --- | --- |
-| `master` | Everything below: no sign-in, service blocking, one Little Arc, performance tweaks, agent browser tools, app icons and the ArcMod menu. |
-| `no-login` | Only what's needed to use Arc without an account, plus service blocking. |
-
-Releases are tagged `vX.Y.Z` on `master` and `vX.Y.Z-no-login` on `no-login`.
-
 ## What it does
 
 - **No sign-in.** The account onboarding screen never opens. Windows, tabs, links, keyboard
@@ -94,16 +95,22 @@ Releases are tagged `vX.Y.Z` on `master` and `vX.Y.Z-no-login` on `no-login`.
   background browser. See [Agent browser tools](#agent-browser-tools).
 - **Separate data.** ArcMod keeps everything in `~/Library/Application Support/ArcMod`.
 
-## Make it look like Arc
+## Settings
 
-The **ArcMod** menu in the menu bar has a few switches:
+ArcMod's own settings are in **Settings → ArcMod** (also **ArcMod → ArcMod Settings…** in the
+menu bar):
 
-- **Show ARC MOD in Sidebar** turns the `ARC MOD` marker at the bottom of the sidebar on or
-  off.
-- **Show MOD Badge on App Icon** turns the badge on the Dock and Finder icon on or off.
-- **Rename App…** changes the name in the menu bar, Dock and Finder, for example back to
-  "Arc". It takes effect the next time ArcMod starts, and rebuilds keep it. ArcMod's data stays
-  in `~/Library/Application Support/ArcMod` whatever you call it.
+- **Show ARC MOD in the sidebar** and **Show the MOD badge on the app icon** turn the marker at
+  the bottom of the sidebar and the badge on the Dock and Finder icon on or off.
+- **App name** changes the name in the menu bar, Dock and Finder, for example back to "Arc". It
+  takes effect the next time ArcMod starts, and rebuilds keep it. ArcMod's data stays in
+  `~/Library/Application Support/ArcMod` whatever you call it.
+- **One Little Arc** makes every link reuse the open Little Arc. Turn it off for Arc's behavior.
+- **Agent browser tools** lets coding agents open their own background browsers.
+- **Import from Arc** and **Updates** are there too.
+
+To use ArcMod as plain Arc without an account, turn off the marker, the badge, One Little Arc
+and the agent tools. Account-free use, service blocking and the performance changes stay on.
 
 ## What you give up
 
@@ -111,9 +118,10 @@ We're working on bringing back what we can.
 
 - Arc account features: sync across devices, Arc Max AI features, and calendar and email
   previews.
-- iCloud, push notifications, and passkeys stored in iCloud Keychain or with Touch ID (see
-  [Passkeys](#passkeys)). The copy is re-signed on your Mac, and Apple ties those features to
-  Arc's original signature.
+- iCloud Keychain passwords and passkeys, until Apple grants this build the browser passkey
+  entitlement (see [Apple Passwords and the login keychain](#apple-passwords-and-the-login-keychain)).
+  Security keys, a phone QR code, and password-manager extensions are unchanged. ArcMod's own
+  saved secrets can use the login keychain without that entitlement.
 - Arc's own updates. ArcMod stays on Arc 1.168.0's app and updates only from this repo.
 
 > **Security updates.** By default ArcMod runs on Arc's own engine, which stops getting Chromium
@@ -132,11 +140,13 @@ This copies cookies, site storage, extensions, history and permissions. Sidebar 
 account data aren't copied. To run it from a terminal instead, quit both browsers, then run
 `bun tools/import-arc-data.ts`.
 
-- macOS asks to read "Arc Safe Storage". Choose **Allow**, not "Always Allow".
+- macOS asks to read "Arc Safe Storage" so the copy can be re-encrypted. Choose **Allow**, not
+  "Always Allow". If it asks ArcMod for that same item, choose **Deny**. Allow **ArcMod Safe Storage**.
 - Your Arc data is only read. ArcMod's previous profile is kept as
-  `Default.pre-import-<timestamp>`.
-- ArcMod uses Chromium's mock keychain, so imported logins are protected only by a public key.
-  Don't import on a shared Mac.
+  `Default.pre-import-<timestamp>`. The copy is re-encrypted for `ArcMod Safe Storage`, not left
+  on Arc's key.
+- Test (`--validation`) and agent builds keep their data under Chromium's fixed test key, so
+  importing into them isn't offered. Don't sign in to real accounts in them.
 
 ## Agent browser tools
 
@@ -149,25 +159,32 @@ codex mcp add arcmod -- /absolute/path/to/bun /absolute/path/to/arc/tools/agent-
 
 Call `open_session` to get a fresh background browser with its own profile, then use
 `open_tab`, `read_page`, `click`, `type`, `navigate`, `screenshot` and `wait_for`. Agent
-browsers don't take focus or touch your own ArcMod windows.
+browsers don't take focus or touch your own ArcMod windows. To turn the tools off, use
+**Settings → ArcMod → Agent browser tools**; `open_session` then refuses.
 [computer-use-tools.md](notes/computer-use-tools.md) covers every tool and its limits.
 
-## Passkeys
+## Apple Passwords and the login keychain
 
-| Passkey | In ArcMod |
-| --- | --- |
-| Saved in iCloud Keychain or on this Mac with Touch ID | **Doesn't work** |
-| On your phone ("Use a phone or tablet", scan the QR code) | Should work; not tested yet |
-| Hardware security key (YubiKey and similar) | Should work; not tested yet |
-| Password-manager extension that handles passkeys (1Password, Bitwarden) | Should work; not tested yet |
+[passwords-keychain.md](notes/passwords-keychain.md) is the full check on your Mac. Short version:
 
-macOS only lets a browser use iCloud Keychain and Touch ID passkeys when Apple has granted its
-developer a passkey entitlement, and the app carries that developer's signature. Arc had one;
-ArcMod is re-signed on your Mac, so it can't. The other three don't need the entitlement. The
-phone option uses Bluetooth, and macOS may ask for permission again after each rebuild.
+| | Self-signed ArcMod | Developer ID with Apple's passkey entitlement |
+| --- | --- | --- |
+| ArcMod's own secrets in the login keychain (`ArcMod Safe Storage`) | Yes, for the everyday app. An older profile is moved once by `bun tools/keychain-profile.ts`. Validation and agent builds stay on the public test key. | Yes |
+| Fill and save from the Passwords app / iCloud Keychain | No. macOS kills Apple's helper | After you install the iCloud Passwords extension. **ArcMod → Set Up iCloud Passwords…** writes the manifest |
+| Passkeys in iCloud Keychain / Touch ID | No. The engine already has the API; macOS will not let this signature call it | Yes, once the entitlement is real |
+| Security key, phone QR code, 1Password / Bitwarden | Should work. Leave them enabled by not embedding the passkey entitlement on a signature Apple has not approved | Should work |
 
-Native passkeys will need a signed ArcMod release from a developer with Apple's passkey
-entitlement. That's planned. Builds from source stay without native passkeys.
+A self-signed certificate (`bash tools/setup-signing-identity.sh`, then
+`bun tools/build-mod.ts --sign-identity "ArcMod Local"`) keeps the login-keychain prompt stable
+across rebuilds. It does not make iCloud Keychain work. Stock Arc is on Apple's allowlist
+(`company.thebrowser.Browser`, team `S6N382Y83G`). ArcMod's bundle id and signature are not, and
+copying the entitlement into an ad hoc signature does not change that.
+
+```sh
+bun tools/icloud-passwords.ts --install --doctor --app /Applications/ArcMod.app
+```
+
+`Status: blocked` is the expected doctor result for a build you signed yourself.
 
 ## Status
 
@@ -185,7 +202,8 @@ Then it:
    the bytes don't match Arc 1.168.0 exactly.
 3. Injects `ArcMod.dylib`, an Objective-C module that filters service requests, enables local
    menu actions and adds the ArcMod menu.
-4. Re-signs the copy ad hoc.
+4. Re-signs the copy ad hoc, unless you passed `--sign-identity`. Restricted entitlements are not
+   added unless you pass `--entitlements`.
 
 Arc's engine is left as it is unless you build with `--engine`.
 [local-mode.md](notes/local-mode.md) and the
@@ -217,7 +235,9 @@ open build/ArcModValidation.app
 `--engine release` downloads the engine release this commit pins
 (`resources/engine-release.json`), checks its SHA-256 and swaps it in for Arc's engine. The
 test copy, ArcModValidation, keeps its own data. Keep it that way for now: Arc's engine for
-1.168.0 is Chromium 155, and opening a profile with Chromium 156 upgrades it for good.
+1.168.0 is Chromium 155, and opening a profile with Chromium 156 upgrades it for good. The
+everyday ArcMod rewrites both "Arc Safe Storage" and "Chromium Safe Storage" onto its own
+Keychain item, so either engine string can open that profile. The password is never Arc's.
 
 To build the engine yourself, see
 [Arc Engine's README](https://github.com/CryogenicPlanet/arc-engine#build-it), then pass its

@@ -6,10 +6,12 @@
 #import <CoreServices/CoreServices.h>
 #import <mach-o/dyld.h>
 #import <sys/xattr.h>
+#import <libproc.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "../local/ServicePolicy.h"
 #import "../local/ShortcutPolicy.h"
+#import "../passwords/KeychainIsolation.h"
 
 static NSString *ArcModLogPath(void) {
 	NSString *session = [NSBundle.mainBundle objectForInfoDictionaryKey:@"ArcModAgentSession"];
@@ -121,6 +123,7 @@ static NSString *const ArcModHideSidebarMarkerKey = @"ArcModHideSidebarMarker";
 static NSString *const ArcModHideIconBadgeKey = @"ArcModHideIconBadge";
 static NSString *const ArcModAppNameKey = @"ArcModAppName";
 static NSString *const ArcModLittleArcPerLinkKey = @"ArcModLittleArcPerLink";
+static NSString *const ArcModAgentToolsKey = @"ArcModAgentToolsEnabled";
 
 // Agent tools find an agent build's windows by its marker, so agent builds always show it.
 static BOOL ArcModSidebarMarkerShown(void) {
@@ -149,11 +152,13 @@ static void ArcModRemoveWindowBadges(void);
 static void ArcModCheckForUpdates(BOOL userInitiated);
 static void ArcModInstallUpdate(void);
 static void ArcModImportFromArc(void);
+static void ArcModSetupICloudPasswords(void);
 static NSString *gAvailableUpdate;
 static void ArcModRefreshAppIcon(BOOL rewriteBundle);
 
-// Only the normal ArcMod can be renamed; tools/build-mod.ts re-applies the name to that build alone.
-static BOOL ArcModCanRename(void) {
+// The everyday ArcMod (not a test or agent build): it alone can be renamed (tools/build-mod.ts re-applies the
+// name to that build) and holds the agent tools setting that tools/agent-session.ts reads.
+static BOOL ArcModIsEverydayBuild(void) {
 	return [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"company.thebrowser.Browser.mod"];
 }
 
@@ -161,7 +166,7 @@ static BOOL ArcModCanRename(void) {
 // the unlocalized one, so renaming never moves ArcMod's data. tools/build-mod.ts writes the same files.
 // Returns NO if a file couldn't be written.
 static BOOL ArcModApplyAppName(void) {
-	if (!ArcModCanRename()) return YES;
+	if (!ArcModIsEverydayBuild()) return YES;
 	NSString *name = [NSUserDefaults.standardUserDefaults stringForKey:ArcModAppNameKey];
 	NSString *resources = NSBundle.mainBundle.resourcePath;
 	NSFileManager *files = NSFileManager.defaultManager;
@@ -202,6 +207,16 @@ static BOOL ArcModOneLittleArc(void) {
 static void ArcModApplyLittleArcSetting(void) {
 	if (ArcModOneLittleArc()) unsetenv("ARCMOD_LITTLE_ARC_PER_LINK");
 	else setenv("ARCMOD_LITTLE_ARC_PER_LINK", "1", 1);
+}
+
+// Read by tools/agent-mcp.ts (through tools/agent-session.ts) before it opens an agent browser.
+static BOOL ArcModAgentToolsOn(void) {
+	id value = [NSUserDefaults.standardUserDefaults objectForKey:ArcModAgentToolsKey];
+	return !value || [value boolValue];
+}
+
+static void ArcModSetAgentToolsOn(BOOL on) {
+	[NSUserDefaults.standardUserDefaults setBool:on forKey:ArcModAgentToolsKey];
 }
 
 static void ArcModSetOneLittleArc(BOOL one) {
@@ -277,6 +292,10 @@ static void ArcModRefreshSettingsPane(void);
 	ArcModImportFromArc();
 }
 
+- (void)setupICloudPasswords:(id)sender {
+	ArcModSetupICloudPasswords();
+}
+
 - (void)update:(id)sender {
 	if (gAvailableUpdate) ArcModInstallUpdate();
 	else ArcModCheckForUpdates(YES);
@@ -302,8 +321,9 @@ static void ArcModRefreshSettingsPane(void);
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
-	if (item.action == @selector(renameApp:)) return ArcModCanRename();
-	if (item.action == @selector(importFromArc:)) return !ArcModAgentSession().length;
+	if (item.action == @selector(renameApp:)) return ArcModIsEverydayBuild();
+	// Test and agent builds keep data under Chromium's fixed test key; real sessions only go into the everyday one.
+	if (item.action == @selector(importFromArc:) || item.action == @selector(setupICloudPasswords:)) return ArcModIsEverydayBuild();
 	if (item.action == @selector(update:)) {
 		item.title = gAvailableUpdate ? [NSString stringWithFormat:@"Update to %@…", gAvailableUpdate] : @"Check for Updates…";
 		return ArcModChecksForUpdates();
@@ -457,6 +477,9 @@ static void ArcModInstallMenu(void) {
 	NSMenuItem *import = [[NSMenuItem alloc] initWithTitle:@"Import from Arc…" action:@selector(importFromArc:) keyEquivalent:@""];
 	import.target = gMenuTarget;
 	[sub addItem:import];
+	NSMenuItem *icloud = [[NSMenuItem alloc] initWithTitle:@"Set Up iCloud Passwords…" action:@selector(setupICloudPasswords:) keyEquivalent:@""];
+	icloud.target = gMenuTarget;
+	[sub addItem:icloud];
 	[sub addItem:NSMenuItem.separatorItem];
 	NSMenuItem *marker = [[NSMenuItem alloc] initWithTitle:@"Show ARC MOD in Sidebar" action:@selector(toggleSidebarMarker:) keyEquivalent:@""];
 	marker.target = gMenuTarget;
@@ -727,15 +750,20 @@ static NSString *ArcModRepository(void) {
 
 // Runs `command` in the source checkout in a new Terminal window. ArcMod keeps running: the command does its
 // checks and work first, then asks ArcMod to quit when it needs to, and reopens it at the end.
-static void ArcModRunInTerminal(NSString *repository, NSString *command, NSString *name) {
+// Returns NO if Terminal didn't get the script. Usable before the app has started (no alerts).
+static BOOL ArcModOpenInTerminal(NSString *repository, NSString *command, NSString *name, NSError **error) {
 	NSString *script = [NSTemporaryDirectory() stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"command"]];
 	NSString *body = [NSString stringWithFormat:@"#!/bin/zsh -l\ncd %@ || exit 1\n%@\n", ArcModShellQuoted(repository), command];
-	NSError *error;
-	BOOL written = [body writeToFile:script atomically:YES encoding:NSUTF8StringEncoding error:&error] &&
-		[NSFileManager.defaultManager setAttributes:@{NSFilePosixPermissions: @0700} ofItemAtPath:script error:&error];
+	BOOL written = [body writeToFile:script atomically:YES encoding:NSUTF8StringEncoding error:error] &&
+		[NSFileManager.defaultManager setAttributes:@{NSFilePosixPermissions: @0700} ofItemAtPath:script error:error];
 	// Arc's Info.plist turns on file quarantine, which would make Gatekeeper refuse a script ArcMod wrote.
 	if (written) removexattr(script.fileSystemRepresentation, "com.apple.quarantine", 0);
-	if (!written || ![NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:script]])
+	return written && [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:script]];
+}
+
+static void ArcModRunInTerminal(NSString *repository, NSString *command, NSString *name) {
+	NSError *error;
+	if (!ArcModOpenInTerminal(repository, command, name, &error))
 		ArcModAlert(@"Couldn't open Terminal", error.localizedDescription ?: @"Terminal didn't open the script.");
 }
 
@@ -760,21 +788,38 @@ static void ArcModInstallUpdate(void) {
 
 // tools/import-arc-data.ts replaces ArcMod's profile, so ArcMod has to be closed while it runs, and so does Arc.
 static void ArcModImportFromArc(void) {
+	if (!ArcModIsEverydayBuild()) return;
 	NSString *repository = ArcModRepository();
 	if (!repository) return;
 	NSAlert *alert = [NSAlert new];
 	alert.messageText = @"Import your Arc data?";
 	alert.informativeText = @"Terminal copies cookies, site storage, extensions, history and permissions from Arc into ArcMod, so your "
 		@"sites stay signed in. Spaces and Arc account data aren't copied. Your current ArcMod profile is kept as a backup.\n\n"
-		@"Terminal asks ArcMod to quit, then waits for you to quit Arc. When macOS asks to read \"Arc Safe Storage\", choose Allow. "
-		@"ArcMod reopens when it's done.";
+		@"Terminal asks ArcMod to quit, then waits for you to quit Arc. When macOS asks to read \"Arc Safe Storage\", choose Allow, not Always Allow. "
+		@"If it asks ArcMod for \"Arc Safe Storage\", choose Deny. Allow \"ArcMod Safe Storage\". ArcMod reopens when it's done.";
 	[alert addButtonWithTitle:@"Import"];
 	[alert addButtonWithTitle:@"Cancel"];
 	if ([alert runModal] != NSAlertFirstButtonReturn) return;
-	BOOL validation = [NSBundle.mainBundle.bundleIdentifier hasSuffix:@".validation"];
-	NSString *command = [NSString stringWithFormat:@"bun tools/import-arc-data.ts%@ --quit-arcmod --relaunch --app %@", validation ? @" --validation" : @"",
+	NSString *command = [NSString stringWithFormat:@"bun tools/import-arc-data.ts --quit-arcmod --relaunch --app %@",
 		ArcModShellQuoted(NSBundle.mainBundle.bundlePath)];
 	ArcModRunInTerminal(repository, command, @"arcmod-import");
+}
+
+static void ArcModSetupICloudPasswords(void) {
+	if (ArcModAgentSession().length) return;
+	NSString *repository = ArcModRepository();
+	if (!repository) return;
+	NSAlert *alert = [NSAlert new];
+	alert.messageText = @"Set up iCloud Passwords?";
+	alert.informativeText = @"Terminal writes Apple's native-messaging manifest into ArcMod's data folder, reports whether this signature can talk to the Passwords app, and opens the extension page.\n\n"
+		@"A self-signed ArcMod cannot fill or save iCloud Keychain passwords, and cannot use iCloud Keychain passkeys. The report says why. Nothing is sent to Arc.";
+	[alert addButtonWithTitle:@"Set Up"];
+	[alert addButtonWithTitle:@"Cancel"];
+	if ([alert runModal] != NSAlertFirstButtonReturn) return;
+	BOOL validation = [NSBundle.mainBundle.bundleIdentifier hasSuffix:@".validation"];
+	NSString *command = [NSString stringWithFormat:@"bun tools/icloud-passwords.ts --install --doctor --open-store%@ --app %@",
+		validation ? @" --validation" : @"", ArcModShellQuoted(NSBundle.mainBundle.bundlePath)];
+	ArcModRunInTerminal(repository, command, @"arcmod-icloud-passwords");
 }
 
 #pragma mark - Settings → ArcMod
@@ -886,10 +931,10 @@ static NSView *ArcModBuildSettingsPane(void) {
 	name.placeholderString = @"ArcMod";
 	name.target = gSettingsTarget;
 	name.action = @selector(rename:);
-	name.enabled = ArcModCanRename();
+	name.enabled = ArcModIsEverydayBuild();
 	[name.widthAnchor constraintEqualToConstant:150].active = YES;
 	gSettingsTarget.nameField = name;
-	NSStackView *nameControl = [NSStackView stackViewWithViews:@[name, ArcModSettingsButton(@"Rename", @selector(rename:), ArcModCanRename())]];
+	NSStackView *nameControl = [NSStackView stackViewWithViews:@[name, ArcModSettingsButton(@"Rename", @selector(rename:), ArcModIsEverydayBuild())]];
 	nameControl.spacing = 6;
 	NSString *version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"ArcModVersion"];
 	NSString *updateTitle = gAvailableUpdate ? [NSString stringWithFormat:@"Update to %@…", gAvailableUpdate] : @"Check for Updates…";
@@ -906,10 +951,20 @@ static NSView *ArcModBuildSettingsPane(void) {
 			ArcModSettingsRow(@"One Little Arc", @"Links reuse the open Little Arc window. Off: Arc's behavior, a new Little Arc unless the link is for the same site. Turning it back on closes extra Little Arcs.",
 				ArcModSettingsSwitch(ArcModOneLittleArc(), @selector(setOneLittleArc:), !agent)),
 		]),
+		ArcModSettingsLabel(@"Agents", 13, NSFontWeightSemibold, NSColor.labelColor),
+		ArcModSettingsGroup(@[
+			ArcModSettingsRow(@"Agent browser tools", @"Lets coding agents open their own background ArcMod browsers through the local MCP server (tools/agent-mcp.ts). Your windows aren't affected either way.",
+				ArcModSettingsSwitch(ArcModAgentToolsOn(), @selector(setAgentTools:), ArcModIsEverydayBuild())),
+		]),
 		ArcModSettingsLabel(@"Your data", 13, NSFontWeightSemibold, NSColor.labelColor),
 		ArcModSettingsGroup(@[
 			ArcModSettingsRow(@"Import from Arc", @"Copies cookies, site storage, extensions, history and permissions from Arc, so your sites stay signed in. Terminal walks you through it.",
-				ArcModSettingsButton(@"Import…", @selector(importFromArc:), !agent)),
+				ArcModSettingsButton(@"Import…", @selector(importFromArc:), ArcModIsEverydayBuild())),
+		]),
+		ArcModSettingsLabel(@"Passwords and Keychain", 13, NSFontWeightSemibold, NSColor.labelColor),
+		ArcModSettingsGroup(@[
+			ArcModSettingsRow(@"iCloud Passwords and passkeys", @"The everyday ArcMod stores its encryption key as \"ArcMod Safe Storage\" and does not read Arc's item. This installs Apple's manifest and reports whether this signature can use the Passwords app. Self-signed builds cannot. Security keys and a phone QR code do not need it.",
+				ArcModSettingsButton(@"Set Up…", @selector(setupICloudPasswords:), ArcModIsEverydayBuild())),
 		]),
 		ArcModSettingsLabel(@"Updates", 13, NSFontWeightSemibold, NSColor.labelColor),
 		ArcModSettingsGroup(@[
@@ -1001,9 +1056,11 @@ static void ArcModShowSettingsPaneIn(NSToolbar *toolbar) {
 - (void)setSidebarMarker:(NSSwitch *)sender { ArcModSetSidebarMarkerShown(sender.state == NSControlStateValueOn); }
 - (void)setIconBadge:(NSSwitch *)sender { ArcModSetIconBadgeShown(sender.state == NSControlStateValueOn); }
 - (void)setOneLittleArc:(NSSwitch *)sender { ArcModSetOneLittleArc(sender.state == NSControlStateValueOn); }
+- (void)setAgentTools:(NSSwitch *)sender { ArcModSetAgentToolsOn(sender.state == NSControlStateValueOn); }
 - (void)setAutomaticUpdates:(NSSwitch *)sender { ArcModSetAutomaticUpdateChecks(sender.state == NSControlStateValueOn); }
 - (void)rename:(id)sender { if (self.nameField) ArcModRename(self.nameField.stringValue); }
 - (void)importFromArc:(id)sender { ArcModImportFromArc(); }
+- (void)setupICloudPasswords:(id)sender { ArcModSetupICloudPasswords(); }
 - (void)update:(id)sender {
 	if (gAvailableUpdate) ArcModInstallUpdate();
 	else ArcModCheckForUpdates(YES);
@@ -1113,8 +1170,12 @@ static void ArcModOpenSettingsPane(void) {
 	ArcModSelectSettingsPane(30);
 }
 
-// Chromium switches ArcMod needs from the first moment: Arc's hosts resolve to nowhere, a mock keychain (so
-// macOS never asks for a keychain key, including the real Arc's), and no sync or background networking.
+// Chromium switches ArcMod needs from the first moment: Arc's hosts resolve to nowhere, and no sync or
+// background networking. The everyday ArcMod keeps cookies and passwords under its own Keychain item
+// ("ArcMod Safe Storage") and never runs with --use-mock-keychain: that key is Chromium's fixed test
+// key, readable by anything that can read the data folder. KeychainIsolation rewrites Chromium's
+// "Arc Safe Storage" lookup onto ArcMod's item, so Arc's item is not read. Test and agent builds hold
+// only disposable data and use the test key, so they never ask for the Keychain.
 // Arc's app hands Chromium its arguments through ArcBrowserApplicationConfiguration (the same initializer in
 // Arc's engine and in Arc Engine), so they're added there; that lets ArcMod open like any app (Finder, Dock,
 // Spotlight). tools/run-mod.sh passes the same ones, and a switch that's already there isn't added twice.
@@ -1132,12 +1193,14 @@ static NSArray<NSString *> *ArcModWithLaunchSwitches(NSArray<NSString *> *argv) 
 	if (![rules isKindOfClass:NSString.class]) rules = @"";
 	NSMutableArray<NSString *> *result = [NSMutableArray new];
 	NSMutableSet<NSString *> *present = [NSMutableSet new];
+	const BOOL everyday = ArcModIsEverydayBuild();
 	BOOL switches = YES;
 	for (id argument in argv) {
 		if (![argument isKindOfClass:NSString.class]) continue;
 		if ([argument isEqualToString:@"--"]) switches = NO;
 		if (switches && result.count && [argument hasPrefix:@"-"]) {
 			NSString *name = ArcModSwitchName(argument);
+			if (everyday && [name isEqualToString:@"use-mock-keychain"]) continue;
 			[present addObject:name];
 			NSRange equals = [argument rangeOfString:@"="];
 			NSString *value = equals.location == NSNotFound ? @"" : [argument substringFromIndex:NSMaxRange(equals)];
@@ -1149,8 +1212,9 @@ static NSArray<NSString *> *ArcModWithLaunchSwitches(NSArray<NSString *> *argv) 
 		[result addObject:argument];
 	}
 	if (!result.count) [result addObject:NSProcessInfo.processInfo.arguments.firstObject ?: @"Arc"];
-	NSMutableArray<NSString *> *wanted = [@[@"--use-mock-keychain", @"--no-default-browser-check", @"--disable-sync",
+	NSMutableArray<NSString *> *wanted = [@[@"--no-default-browser-check", @"--disable-sync",
 		@"--disable-background-networking"] mutableCopy];
+	if (!everyday) [wanted insertObject:@"--use-mock-keychain" atIndex:0];
 	if (rules.length) [wanted addObject:[@"--host-resolver-rules=" stringByAppendingString:rules]];
 	NSUInteger insertAt = 1;
 	for (NSString *argument in wanted)
@@ -1166,7 +1230,7 @@ static id ArcModConfigurationInit(__attribute__((ns_consumed)) id self, SEL comm
 		NSUInteger applicationID, BOOL isProduction, NSUInteger restorationPolicy, BOOL loadAllProfiles, BOOL quitRunLoop,
 		NSString *suiteName) __attribute__((ns_returns_retained)) {
 	NSArray<NSString *> *extended = ArcModWithLaunchSwitches(argv);
-	if (![extended isEqualToArray:argv]) ArcModLog(@"launch switches: added %lu", (unsigned long)(extended.count - argv.count));
+	if (![extended isEqualToArray:argv]) ArcModLog(@"launch switches: now %lu argument(s), was %lu", (unsigned long)extended.count, (unsigned long)argv.count);
 	return gOriginalConfigurationInit(self, command, (int)extended.count, extended, profilePath, applicationID, isProduction,
 		restorationPolicy, loadAllProfiles, quitRunLoop, suiteName);
 }
@@ -1180,14 +1244,17 @@ static void ArcModAddLaunchSwitches(void) {
 		gOriginalConfigurationInit = (ConfigurationInitIMP)method_setImplementation(method, (IMP)ArcModConfigurationInit);
 		return;
 	}
-	// Fail closed: without these switches Chromium would use the real keychain (asking for "Arc Safe Storage") and
-	// reach Arc's hosts. If the engine's initializer isn't the expected one, restart this process with them.
+	// Fail closed: without these switches Chromium would reach Arc's hosts, the everyday ArcMod could run on the
+	// test key, and a test build could ask for the Keychain. If the engine's initializer isn't the expected one,
+	// restart this process with them.
 	NSArray<NSString *> *arguments = NSProcessInfo.processInfo.arguments;
 	NSMutableSet<NSString *> *present = [NSMutableSet new];
 	for (NSString *argument in arguments) [present addObject:ArcModSwitchName(argument)];
-	NSSet<NSString *> *required = [NSSet setWithArray:@[@"use-mock-keychain", @"no-default-browser-check", @"disable-sync",
+	NSMutableSet<NSString *> *required = [NSMutableSet setWithArray:@[@"no-default-browser-check", @"disable-sync",
 		@"disable-background-networking", @"host-resolver-rules"]];
-	if ([required isSubsetOfSet:present]) return;
+	const BOOL everyday = ArcModIsEverydayBuild();
+	if (!everyday) [required addObject:@"use-mock-keychain"];
+	if ([required isSubsetOfSet:present] && !(everyday && [present containsObject:@"use-mock-keychain"])) return;
 	NSArray<NSString *> *extended = ArcModWithLaunchSwitches(arguments);
 	if (getenv("ARCMOD_RELAUNCHED_WITH_SWITCHES")) {
 		fputs("ArcMod: couldn't add its launch switches; refusing to start without them\n", stderr);
@@ -1217,8 +1284,51 @@ static void ArcModEnsureSingleInstance(void) {
 	}
 }
 
+// The everyday ArcMod keeps cookies and passwords under its own Keychain item, "ArcMod Safe Storage".
+// KeychainIsolation sends Chromium's "Arc Safe Storage" lookup there. A data folder from
+// before that is under Chromium's test key, and Chromium deletes saved passwords it can't decrypt, so Chromium
+// must not open it until tools/keychain-profile.ts has moved it over with ArcMod closed. The tool leaves a
+// marker in User Data; a new data folder starts on the Keychain and gets the marker right away. While the tool
+// runs (its lock names a live pid) or has a backup, the data folder isn't touched here.
+static void ArcModEnsureKeychainProfile(void) {
+	if (!ArcModIsEverydayBuild()) return;
+	NSFileManager *files = NSFileManager.defaultManager;
+	NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+	// The unlocalized name: Rename App only changes the localized one, and Arc names the data folder after this.
+	NSString *folder = [support stringByAppendingPathComponent:NSBundle.mainBundle.infoDictionary[@"CFBundleName"]];
+	NSString *userData = [folder stringByAppendingPathComponent:@"User Data"];
+	if ([files fileExistsAtPath:[userData stringByAppendingPathComponent:@".arcmod-keychain"]]) return;
+	NSString *lock = [NSString stringWithContentsOfFile:[folder stringByAppendingPathComponent:@"keychain-move.lock"] encoding:NSUTF8StringEncoding error:nil];
+	char holder[64] = {0};
+	if (lock.intValue > 0 && proc_name(lock.intValue, holder, sizeof holder) > 0 && strcmp(holder, "bun") == 0) exit(0);
+	BOOL leftovers = NO;
+	for (NSString *suffix in @[@".keychain-backup", @".keychain-backup.partial", @".keychain-aside"])
+		leftovers |= [files fileExistsAtPath:[userData stringByAppendingString:suffix]];
+	if (!leftovers && ![files fileExistsAtPath:userData] &&
+		[files createDirectoryAtPath:userData withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0700} error:nil] &&
+		[@"new data folder\n" writeToFile:[userData stringByAppendingPathComponent:@".arcmod-keychain"] atomically:YES
+			encoding:NSUTF8StringEncoding error:nil])
+		return;
+	ArcModLog(@"keychain: %@ is still under Chromium's test key; moving it to the Keychain in Terminal", userData);
+	NSString *repository = NSBundle.mainBundle.infoDictionary[@"ArcModRepository"];
+	NSString *command = [NSString stringWithFormat:@"bun tools/keychain-profile.ts --relaunch --app %@", ArcModShellQuoted(NSBundle.mainBundle.bundlePath)];
+	BOOL tool = [repository isKindOfClass:NSString.class] &&
+		[files fileExistsAtPath:[repository stringByAppendingPathComponent:@"tools/keychain-profile.ts"]];
+	if (!tool || !ArcModOpenInTerminal(repository, command, @"arcmod-keychain", NULL)) {
+		// No app yet: CFUserNotification shows an alert without NSApplication.
+		NSString *message = [NSString stringWithFormat:@"ArcMod's saved cookies and passwords still use Chromium's test key and need to move "
+			@"to the Keychain before ArcMod opens. In ArcMod's source folder, run:\n\nbun tools/keychain-profile.ts\n\n"
+			@"or, to delete them and sign in again:\n\nbun tools/keychain-profile.ts --discard"];
+		CFUserNotificationDisplayAlert(0, kCFUserNotificationStopAlertLevel, NULL, NULL, NULL, CFSTR("ArcMod can't open yet"),
+			(__bridge CFStringRef)message, NULL, NULL, NULL, NULL);
+	}
+	exit(0);
+}
+
 __attribute__((constructor)) static void ArcModInit(void) {
 	ArcModEnsureSingleInstance();
+	ArcModResolveSecretStorage();
+	ArcModEnsureKeychainProfile();
 	ArcModApplyLittleArcSetting();
 	ArcModAddLaunchSwitches();
 	ArcModInstallSettingsPane();
