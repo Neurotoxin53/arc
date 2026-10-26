@@ -1,17 +1,17 @@
 // Until 2026-10-25 the everyday ArcMod ran with --use-mock-keychain, so the cookies and passwords it saved
 // are encrypted with Chromium's fixed test key, which anything that can read the data folder can undo. It now
-// uses the Keychain's "Arc Safe Storage" item, like Arc. This moves a data folder's saved secrets over, once,
+// uses its own Keychain item, "ArcMod Safe Storage", and does not read or write Arc's. This moves a data folder's saved secrets over, once,
 // with ArcMod closed. ArcMod.dylib won't start Chromium on a data folder without the marker this leaves (Chromium
 // deletes saved passwords it can't decrypt) and opens Terminal with this command instead.
 //   bun tools/keychain-profile.ts [--discard] [--relaunch [--app <ArcMod.app>]]
 // --discard deletes the test-key cookies, passwords and cards instead of moving them (you sign in again).
 // The data folder is cloned first and put back if anything fails; the clone is deleted afterwards, since it
 // holds the test-key values.
-import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync, writeSync, type Dirent } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { deleteTestKeyRows, isSqlite, recryptDatabase, recryptJsonText, toKeychain } from "./oscrypt";
+import { ensureLoginKeychainPassword } from "./secret-storage";
 
 export const MARKER = ".arcmod-keychain";
 const BUNDLE_ID = "company.thebrowser.Browser.mod";
@@ -19,19 +19,8 @@ const BUNDLE_ID = "company.thebrowser.Browser.mod";
 // The everyday ArcMod's data folder (named after the unlocalized CFBundleName, so renaming doesn't move it).
 export const everydayDataFolder = (): string => join(homedir(), "Library/Application Support/ArcMod");
 
-// Arc's Keychain password, created like Chromium would if Arc never ran on this Mac. macOS asks before
-// `security` reads it.
-export const arcSafeStoragePassword = (): string => {
-  const read = Bun.spawnSync(["security", "find-generic-password", "-w", "-s", "Arc Safe Storage", "-a", "Arc"], { stdout: "pipe", stderr: "pipe" });
-  if (read.exitCode === 0) return read.stdout.toString().trim();
-  if (!read.stderr.toString().includes("could not be found")) {
-    throw new Error(`couldn't read "Arc Safe Storage" from the Keychain: ${read.stderr.toString().trim()}`);
-  }
-  const password = randomBytes(16).toString("base64");
-  const add = Bun.spawnSync(["security", "add-generic-password", "-s", "Arc Safe Storage", "-a", "Arc", "-w", password], { stderr: "pipe" });
-  if (add.exitCode !== 0) throw new Error(`couldn't create "Arc Safe Storage" in the Keychain: ${add.stderr.toString().trim()}`);
-  return password;
-};
+// ArcMod's own Keychain password. Never creates or reads Arc's "Arc Safe Storage" item.
+export const arcModSafeStoragePassword = (): string => ensureLoginKeychainPassword("ArcMod", []);
 
 // Caches and stores Chromium never encrypts with OSCrypt; skipped to keep the walk short.
 const skipped = new Set(["Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache", "GrShaderCache", "ShaderCache",
@@ -132,7 +121,12 @@ export const moveDataFolderToKeychain = (dataFolder: string, keychainPassword: (
     writeFileSync(marker, "new data folder\n", { mode: 0o600 });
     return;
   }
-  const clone = Bun.spawnSync(["cp", "-cRp", userData, partial], { stderr: "pipe" });
+  // -c is APFS clonefile (macOS). Fall back to a normal copy where that flag does not exist.
+  let clone = Bun.spawnSync(["cp", "-cRp", userData, partial], { stderr: "pipe" });
+  if (clone.exitCode !== 0) {
+    rmSync(partial, { recursive: true, force: true });
+    clone = Bun.spawnSync(["cp", "-Rp", userData, partial], { stderr: "pipe" });
+  }
   if (clone.exitCode !== 0) {
     rmSync(partial, { recursive: true, force: true });
     throw new Error(`couldn't back up ${userData}: ${clone.stderr.toString().trim()}`);
@@ -226,9 +220,9 @@ const main = async (args: readonly string[]): Promise<void> => {
     const discard = args.includes("--discard");
     console.log(discard
       ? "• deleting ArcMod's saved cookies, passwords and cards that use Chromium's test key"
-      : '• moving ArcMod\'s saved cookies and passwords from Chromium\'s test key to the Keychain\n  macOS asks to let `security` read "Arc Safe Storage": choose Allow');
-    moveDataFolderToKeychain(dataFolder, discard ? "discard" : arcSafeStoragePassword);
-    console.log("Done: ArcMod now keeps them in the Keychain. When ArcMod opens, allow it to use \"Arc Safe Storage\" (Always Allow).");
+      : "• moving ArcMod's saved cookies and passwords from Chromium's test key to ArcMod's own Keychain item\n  macOS asks to let `security` use \"ArcMod Safe Storage\": choose Allow. If it asks for \"Arc Safe Storage\", choose Deny");
+    moveDataFolderToKeychain(dataFolder, discard ? "discard" : arcModSafeStoragePassword);
+    console.log("Done: ArcMod now keeps them in \"ArcMod Safe Storage\". When ArcMod opens, allow that item (Always Allow). If macOS asks for \"Arc Safe Storage\", choose Deny.");
   } finally {
     release();
   }

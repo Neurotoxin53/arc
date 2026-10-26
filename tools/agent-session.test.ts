@@ -32,17 +32,21 @@ describe("agent build identity", () => {
     expect(parseBuildOptions([]).source).toBe("/Applications/Arc.app");
     expect(parseBuildOptions(["--engine", "/tmp/out/ArcCore.framework"]).engine).toBe("/tmp/out/ArcCore.framework");
     expect(parseBuildOptions([]).engine).toBeUndefined();
+    expect(parseBuildOptions(["--sign-identity", "ArcMod Local", "--entitlements", "resources/ArcMod.passkeys.entitlements.plist", "--hardened-runtime", "--timestamp"])).toMatchObject({
+      signIdentity: "ArcMod Local", entitlements: "resources/ArcMod.passkeys.entitlements.plist", hardenedRuntime: true, timestamp: true,
+    });
+    expect(parseBuildOptions([]).signIdentity).toBeUndefined();
   });
 
   test("rejects conflicting, duplicate, incomplete and unknown arguments", () => {
-    for (const args of [["--validation", "--agent", "scout"], ["--agent"], ["--source"], ["--source", "--validation"], ["--agent", "scout", "--agent", "scout"], ["--validation", "--validation"], ["--source", "x", "--source", "y"], ["--engine"], ["--engine", "a", "--engine", "b"], ["--unknown"], ["positional"], ["--agent=scout"]]) {
+    for (const args of [["--validation", "--agent", "scout"], ["--agent"], ["--source"], ["--source", "--validation"], ["--agent", "scout", "--agent", "scout"], ["--validation", "--validation"], ["--source", "x", "--source", "y"], ["--engine"], ["--engine", "a", "--engine", "b"], ["--sign-identity"], ["--entitlements"], ["--hardened-runtime", "--hardened-runtime"], ["--unknown"], ["positional"], ["--agent=scout"]]) {
       expect(() => parseBuildOptions(args)).toThrow();
     }
   });
 });
 
 // Real Bash/PlistBuddy parsing, with every launch/prefs/data mutation replaced by a recording stub.
-const launch = (args: readonly string[], options: { readonly running?: string; readonly plistAgent?: string; readonly installed?: boolean } = {}) => {
+const launch = (args: readonly string[], options: { readonly running?: string; readonly plistAgent?: string; readonly installed?: boolean; readonly secretStorage?: string } = {}) => {
   const root = mkdtempSync(join(tmpdir(), "arc-agent-launch-"));
   try {
     mkdirSync(join(root, "tools"));
@@ -60,10 +64,15 @@ const launch = (args: readonly string[], options: { readonly running?: string; r
     }
     for (const command of ["open", "defaults", "mkdir", "chmod", "pgrep"]) {
       const path = join(root, "stubs", command);
-      writeFileSync(path, `#!/bin/bash\nprintf '%s\\0' "$@" >> "$ARC_TEST_TRACE/${command}"\n${command === "pgrep" ? 'if [[ -n "$ARC_TEST_RUNNING" ]]; then echo "$ARC_TEST_RUNNING"; else exit 1; fi' : "exit 0"}\n`);
+      const body = command === "pgrep"
+        ? "#!/bin/bash\nprintf '%s\\0' \"$@\" >> \"$ARC_TEST_TRACE/pgrep\"\nif [[ -n \"$ARC_TEST_RUNNING\" ]]; then echo \"$ARC_TEST_RUNNING\"; else exit 1; fi\n"
+        : command === "defaults"
+          ? "#!/bin/bash\nprintf '%s\\0' \"$@\" >> \"$ARC_TEST_TRACE/defaults\"\nif [[ \"$1\" == \"read\" ]]; then printf '%s\\n' \"${ARC_TEST_SECRET_STORAGE:-}\"; fi\nexit 0\n"
+          : `#!/bin/bash\nprintf '%s\\0' "$@" >> "$ARC_TEST_TRACE/${command}"\nexit 0\n`;
+      writeFileSync(path, body);
       chmodSync(path, 0o755);
     }
-    const result = Bun.spawnSync(["/bin/bash", join(root, "tools/run-mod.sh"), ...args], { env: { ...process.env, PATH: `${root}/stubs:/usr/bin:/bin`, ARC_TEST_TRACE: root, ARC_TEST_RUNNING: options.running ?? "", ARCMOD_INSTALL_DIRS: join(root, "Applications") }, stdout: "pipe", stderr: "pipe" });
+    const result = Bun.spawnSync(["/bin/bash", join(root, "tools/run-mod.sh"), ...args], { env: { ...process.env, PATH: `${root}/stubs:/usr/bin:/bin`, ARC_TEST_TRACE: root, ARC_TEST_RUNNING: options.running ?? "", ARC_TEST_SECRET_STORAGE: options.secretStorage ?? "", ARCMOD_INSTALL_DIRS: join(root, "Applications") }, stdout: "pipe", stderr: "pipe" });
     const recorded = (command: string): string[] => existsSync(join(root, command)) ? readFileSync(join(root, command), "utf8").split("\0").slice(0, -1) : [];
     return { success: result.success, stderr: result.stderr.toString(), stdout: result.stdout.toString(), open: recorded("open"), defaults: recorded("defaults"), mkdir: recorded("mkdir"), pgrep: recorded("pgrep"), root };
   } finally {
@@ -76,6 +85,7 @@ describe("launcher argument semantics", () => {
     const installed = launch([], { installed: true });
     expect(installed.success).toBe(true);
     expect(installed.open).toContain(`${installed.root}/Applications/ArcMod.app`);
+    expect(installed.open).not.toContain("--use-mock-keychain");
     const debug = launch(["--debug"], { installed: true });
     expect(debug.success).toBe(true);
     expect(debug.open).toContain(`${debug.root}/build/ArcMod.app`);
@@ -88,7 +98,15 @@ describe("launcher argument semantics", () => {
       expect(result.open).toContain(`${result.root}/build/${name}.app`);
       expect(result.defaults).toContain(domain);
       expect(result.open).not.toContain("-g");
+      if (name === "ArcMod") expect(result.open).not.toContain("--use-mock-keychain");
+      else expect(result.open).toContain("--use-mock-keychain");
     }
+  });
+
+  test("agent sessions keep the mock keychain even when a login preference is set", () => {
+    const agent = launch(["--agent", "scout"], { secretStorage: "login" });
+    expect(agent.success).toBe(true);
+    expect(agent.open).toContain("--use-mock-keychain");
   });
 
   test("background/CDP switches remain separate arguments and request a background launch", () => {

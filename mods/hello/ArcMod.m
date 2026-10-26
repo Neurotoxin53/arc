@@ -11,6 +11,7 @@
 #import <objc/message.h>
 #import "../local/ServicePolicy.h"
 #import "../local/ShortcutPolicy.h"
+#import "../passwords/KeychainIsolation.h"
 
 static NSString *ArcModLogPath(void) {
 	NSString *session = [NSBundle.mainBundle objectForInfoDictionaryKey:@"ArcModAgentSession"];
@@ -151,6 +152,7 @@ static void ArcModRemoveWindowBadges(void);
 static void ArcModCheckForUpdates(BOOL userInitiated);
 static void ArcModInstallUpdate(void);
 static void ArcModImportFromArc(void);
+static void ArcModSetupICloudPasswords(void);
 static NSString *gAvailableUpdate;
 static void ArcModRefreshAppIcon(BOOL rewriteBundle);
 
@@ -290,6 +292,10 @@ static void ArcModRefreshSettingsPane(void);
 	ArcModImportFromArc();
 }
 
+- (void)setupICloudPasswords:(id)sender {
+	ArcModSetupICloudPasswords();
+}
+
 - (void)update:(id)sender {
 	if (gAvailableUpdate) ArcModInstallUpdate();
 	else ArcModCheckForUpdates(YES);
@@ -317,7 +323,7 @@ static void ArcModRefreshSettingsPane(void);
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
 	if (item.action == @selector(renameApp:)) return ArcModIsEverydayBuild();
 	// Test and agent builds keep data under Chromium's fixed test key; real sessions only go into the everyday one.
-	if (item.action == @selector(importFromArc:)) return ArcModIsEverydayBuild();
+	if (item.action == @selector(importFromArc:) || item.action == @selector(setupICloudPasswords:)) return ArcModIsEverydayBuild();
 	if (item.action == @selector(update:)) {
 		item.title = gAvailableUpdate ? [NSString stringWithFormat:@"Update to %@…", gAvailableUpdate] : @"Check for Updates…";
 		return ArcModChecksForUpdates();
@@ -471,6 +477,9 @@ static void ArcModInstallMenu(void) {
 	NSMenuItem *import = [[NSMenuItem alloc] initWithTitle:@"Import from Arc…" action:@selector(importFromArc:) keyEquivalent:@""];
 	import.target = gMenuTarget;
 	[sub addItem:import];
+	NSMenuItem *icloud = [[NSMenuItem alloc] initWithTitle:@"Set Up iCloud Passwords…" action:@selector(setupICloudPasswords:) keyEquivalent:@""];
+	icloud.target = gMenuTarget;
+	[sub addItem:icloud];
 	[sub addItem:NSMenuItem.separatorItem];
 	NSMenuItem *marker = [[NSMenuItem alloc] initWithTitle:@"Show ARC MOD in Sidebar" action:@selector(toggleSidebarMarker:) keyEquivalent:@""];
 	marker.target = gMenuTarget;
@@ -786,13 +795,31 @@ static void ArcModImportFromArc(void) {
 	alert.messageText = @"Import your Arc data?";
 	alert.informativeText = @"Terminal copies cookies, site storage, extensions, history and permissions from Arc into ArcMod, so your "
 		@"sites stay signed in. Spaces and Arc account data aren't copied. Your current ArcMod profile is kept as a backup.\n\n"
-		@"Terminal asks ArcMod to quit, then waits for you to quit Arc. ArcMod reopens when it's done.";
+		@"Terminal asks ArcMod to quit, then waits for you to quit Arc. When macOS asks to read \"Arc Safe Storage\", choose Allow, not Always Allow. "
+		@"If it asks ArcMod for \"Arc Safe Storage\", choose Deny. Allow \"ArcMod Safe Storage\". ArcMod reopens when it's done.";
 	[alert addButtonWithTitle:@"Import"];
 	[alert addButtonWithTitle:@"Cancel"];
 	if ([alert runModal] != NSAlertFirstButtonReturn) return;
 	NSString *command = [NSString stringWithFormat:@"bun tools/import-arc-data.ts --quit-arcmod --relaunch --app %@",
 		ArcModShellQuoted(NSBundle.mainBundle.bundlePath)];
 	ArcModRunInTerminal(repository, command, @"arcmod-import");
+}
+
+static void ArcModSetupICloudPasswords(void) {
+	if (ArcModAgentSession().length) return;
+	NSString *repository = ArcModRepository();
+	if (!repository) return;
+	NSAlert *alert = [NSAlert new];
+	alert.messageText = @"Set up iCloud Passwords?";
+	alert.informativeText = @"Terminal writes Apple's native-messaging manifest into ArcMod's data folder, reports whether this signature can talk to the Passwords app, and opens the extension page.\n\n"
+		@"A self-signed ArcMod cannot fill or save iCloud Keychain passwords, and cannot use iCloud Keychain passkeys. The report says why. Nothing is sent to Arc.";
+	[alert addButtonWithTitle:@"Set Up"];
+	[alert addButtonWithTitle:@"Cancel"];
+	if ([alert runModal] != NSAlertFirstButtonReturn) return;
+	BOOL validation = [NSBundle.mainBundle.bundleIdentifier hasSuffix:@".validation"];
+	NSString *command = [NSString stringWithFormat:@"bun tools/icloud-passwords.ts --install --doctor --open-store%@ --app %@",
+		validation ? @" --validation" : @"", ArcModShellQuoted(NSBundle.mainBundle.bundlePath)];
+	ArcModRunInTerminal(repository, command, @"arcmod-icloud-passwords");
 }
 
 #pragma mark - Settings → ArcMod
@@ -934,6 +961,11 @@ static NSView *ArcModBuildSettingsPane(void) {
 			ArcModSettingsRow(@"Import from Arc", @"Copies cookies, site storage, extensions, history and permissions from Arc, so your sites stay signed in. Terminal walks you through it.",
 				ArcModSettingsButton(@"Import…", @selector(importFromArc:), ArcModIsEverydayBuild())),
 		]),
+		ArcModSettingsLabel(@"Passwords and Keychain", 13, NSFontWeightSemibold, NSColor.labelColor),
+		ArcModSettingsGroup(@[
+			ArcModSettingsRow(@"iCloud Passwords and passkeys", @"The everyday ArcMod stores its encryption key as \"ArcMod Safe Storage\" and does not read Arc's item. This installs Apple's manifest and reports whether this signature can use the Passwords app. Self-signed builds cannot. Security keys and a phone QR code do not need it.",
+				ArcModSettingsButton(@"Set Up…", @selector(setupICloudPasswords:), ArcModIsEverydayBuild())),
+		]),
 		ArcModSettingsLabel(@"Updates", 13, NSFontWeightSemibold, NSColor.labelColor),
 		ArcModSettingsGroup(@[
 			ArcModSettingsRow(@"Check for updates automatically", @"Checks this repo's GitHub releases once a day.",
@@ -1028,6 +1060,7 @@ static void ArcModShowSettingsPaneIn(NSToolbar *toolbar) {
 - (void)setAutomaticUpdates:(NSSwitch *)sender { ArcModSetAutomaticUpdateChecks(sender.state == NSControlStateValueOn); }
 - (void)rename:(id)sender { if (self.nameField) ArcModRename(self.nameField.stringValue); }
 - (void)importFromArc:(id)sender { ArcModImportFromArc(); }
+- (void)setupICloudPasswords:(id)sender { ArcModSetupICloudPasswords(); }
 - (void)update:(id)sender {
 	if (gAvailableUpdate) ArcModInstallUpdate();
 	else ArcModCheckForUpdates(YES);
@@ -1138,10 +1171,11 @@ static void ArcModOpenSettingsPane(void) {
 }
 
 // Chromium switches ArcMod needs from the first moment: Arc's hosts resolve to nowhere, and no sync or
-// background networking. The everyday ArcMod keeps cookies and passwords under Arc's own Keychain item
-// ("Arc Safe Storage"), like Arc, and never runs with --use-mock-keychain: that key is Chromium's fixed test
-// key, readable by anything that can read the data folder. Test and agent builds hold only disposable data
-// and use it, so they never ask for the Keychain.
+// background networking. The everyday ArcMod keeps cookies and passwords under its own Keychain item
+// ("ArcMod Safe Storage") and never runs with --use-mock-keychain: that key is Chromium's fixed test
+// key, readable by anything that can read the data folder. KeychainIsolation rewrites Chromium's
+// "Arc Safe Storage" lookup onto ArcMod's item, so Arc's item is not read. Test and agent builds hold
+// only disposable data and use the test key, so they never ask for the Keychain.
 // Arc's app hands Chromium its arguments through ArcBrowserApplicationConfiguration (the same initializer in
 // Arc's engine and in Arc Engine), so they're added there; that lets ArcMod open like any app (Finder, Dock,
 // Spotlight). tools/run-mod.sh passes the same ones, and a switch that's already there isn't added twice.
@@ -1196,7 +1230,7 @@ static id ArcModConfigurationInit(__attribute__((ns_consumed)) id self, SEL comm
 		NSUInteger applicationID, BOOL isProduction, NSUInteger restorationPolicy, BOOL loadAllProfiles, BOOL quitRunLoop,
 		NSString *suiteName) __attribute__((ns_returns_retained)) {
 	NSArray<NSString *> *extended = ArcModWithLaunchSwitches(argv);
-	if (![extended isEqualToArray:argv]) ArcModLog(@"launch switches: added %lu", (unsigned long)(extended.count - argv.count));
+	if (![extended isEqualToArray:argv]) ArcModLog(@"launch switches: now %lu argument(s), was %lu", (unsigned long)extended.count, (unsigned long)argv.count);
 	return gOriginalConfigurationInit(self, command, (int)extended.count, extended, profilePath, applicationID, isProduction,
 		restorationPolicy, loadAllProfiles, quitRunLoop, suiteName);
 }
@@ -1250,7 +1284,8 @@ static void ArcModEnsureSingleInstance(void) {
 	}
 }
 
-// The everyday ArcMod keeps cookies and passwords under the Keychain's "Arc Safe Storage" key. A data folder from
+// The everyday ArcMod keeps cookies and passwords under its own Keychain item, "ArcMod Safe Storage".
+// KeychainIsolation sends Chromium's "Arc Safe Storage" lookup there. A data folder from
 // before that is under Chromium's test key, and Chromium deletes saved passwords it can't decrypt, so Chromium
 // must not open it until tools/keychain-profile.ts has moved it over with ArcMod closed. The tool leaves a
 // marker in User Data; a new data folder starts on the Keychain and gets the marker right away. While the tool
@@ -1292,6 +1327,7 @@ static void ArcModEnsureKeychainProfile(void) {
 
 __attribute__((constructor)) static void ArcModInit(void) {
 	ArcModEnsureSingleInstance();
+	ArcModResolveSecretStorage();
 	ArcModEnsureKeychainProfile();
 	ArcModApplyLittleArcSetting();
 	ArcModAddLaunchSwitches();

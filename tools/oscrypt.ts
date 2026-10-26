@@ -1,7 +1,7 @@
 // Chromium's macOS encryption for cookies, passwords and other secrets ("OSCrypt" v10 values): AES-128-CBC
-// with a key derived from a password. Arc and the everyday ArcMod keep that password in the Keychain item
-// "Arc Safe Storage"; test and agent builds run with --use-mock-keychain, whose password is the fixed
-// "mock_password" from Chromium's source.
+// with a key derived from a password. Arc keeps that password in "Arc Safe Storage". The everyday ArcMod
+// keeps its own copy in "ArcMod Safe Storage" and does not read Arc's item. Test and agent builds run with
+// --use-mock-keychain, whose password is the fixed "mock_password" from Chromium's source.
 import { Database } from "bun:sqlite";
 import { createCipheriv, createDecipheriv, createHash, pbkdf2Sync } from "node:crypto";
 import { closeSync, lstatSync, openSync, readSync } from "node:fs";

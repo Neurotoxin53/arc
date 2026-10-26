@@ -101,7 +101,8 @@ defaults write "$DOMAIN" firebaseSyncEnabled -bool false
 SERVICE_RULES="$(/usr/libexec/PlistBuddy -c 'Print :ArcModHostResolverRules' "$APP/Contents/Info.plist")"
 ARGS=(--no-default-browser-check ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} --disable-sync --disable-background-networking "--host-resolver-rules=$SERVICE_RULES")
 # Test and agent builds hold disposable data under Chromium's fixed test key, so they never ask for the
-# Keychain. The everyday ArcMod uses Arc's Keychain item, like Arc (ArcMod.dylib also enforces both).
+# Keychain. The everyday ArcMod uses its own item, "ArcMod Safe Storage"; ArcMod.dylib rewrites Chromium's
+# "Arc Safe Storage" lookup and does not read Arc's item.
 if [[ -n "$AGENT" || $VALIDATION == 1 ]]; then ARGS=(--use-mock-keychain "${ARGS[@]}"); fi
 if [[ -n "$AGENT" ]]; then
   CHROMIUM_DATA="$DATA/Agent Chromium Data"

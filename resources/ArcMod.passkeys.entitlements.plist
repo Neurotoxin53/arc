@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Use only after Apple has approved com.apple.developer.web-browser.public-key-credential
+     for this team's App ID, together with --sign-identity and --hardened-runtime.
+     Embedding this key in an ad hoc or self-signed build does not enable iCloud
+     Keychain, and it makes Chromium skip working phone and security-key fallbacks. -->
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.developer.web-browser.public-key-credential</key>
+	<true/>
+</dict>
+</plist>
